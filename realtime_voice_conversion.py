@@ -120,14 +120,16 @@ class RealtimeVC:
 
         # 处理输入音频
         indata = librosa.to_mono(indata.T)
-        self.input_wav[:-self.block_frame] = self.input_wav[self.block_frame:].clone()
-        self.input_wav[-self.block_frame:] = torch.from_numpy(indata).to(self.config.device)
+        padded_indata = np.zeros(self.block_frame, dtype=indata.dtype)
+        padded_indata[:len(indata)] = indata
+        #self.input_wav[:-self.block_frame] = self.input_wav[self.block_frame:].clone()
+        self.input_wav[-self.block_frame:] = torch.from_numpy(padded_indata).to(self.config.device)
 
         # 重采样到16kHz
-        self.input_wav_res[:-160 * (indata.shape[0] // self.zc + 1)] = self.input_wav_res[160 * (indata.shape[0] // self.zc + 1):].clone()
-        self.input_wav_res[-160 * (indata.shape[0] // self.zc + 1):] = F.interpolate(
+        target_length = 160 * (indata.shape[0] // self.zc + 1)
+        self.input_wav_res[-target_length:] = F.interpolate(
             self.input_wav[-indata.shape[0] - 2 * self.zc:].unsqueeze(0).unsqueeze(0),
-            scale_factor=160 / self.zc,
+            size=(target_length,),
             mode='linear',
             align_corners=False
         ).squeeze()
@@ -138,7 +140,7 @@ class RealtimeVC:
             160 * self.block_frame // self.zc,
             self.extra_frame // self.zc,
             (self.block_frame + self.crossfade_frame) // self.zc,
-            "fcpe"  # 可以根据需要更改音高提取方法
+            "rmvpe"  # 可以根据需要更改音高提取方法
         )
 
         # 重采样回原始采样率（如果需要）
@@ -151,21 +153,33 @@ class RealtimeVC:
             ).squeeze()
 
         # SOLA算法
-        conv_input = infer_wav[None, None, :self.crossfade_frame + self.zc]
-        cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
-        cor_den = torch.sqrt(
-            F.conv1d(conv_input**2, torch.ones(1, 1, self.crossfade_frame, device=self.config.device)) + 1e-8
-        )
-        sola_offset = torch.argmax(cor_nom[0, 0] / cor_den[0, 0])
-        infer_wav = infer_wav[sola_offset:]
+        if infer_wav.shape[0] >= self.block_frame + self.crossfade_frame:
+            self.sola_buffer[:] = infer_wav[self.block_frame:self.block_frame + self.crossfade_frame]
+        else:
+            # 复制可用的样本
+            available_samples = max(0, infer_wav.shape[0] - self.block_frame)
+            self.sola_buffer[:available_samples] = infer_wav[self.block_frame:]
+            # 用零填充剩余部分
+            self.sola_buffer[available_samples:] = 0
 
         # 应用交叉淡入淡出
         infer_wav[:self.crossfade_frame] *= self.fade_in_window
         infer_wav[:self.crossfade_frame] += self.sola_buffer * self.fade_out_window
         self.sola_buffer[:] = infer_wav[self.block_frame:self.block_frame + self.crossfade_frame]
 
-        # 将转换后的音频写入输出缓冲区
-        outdata[:] = infer_wav[:self.block_frame].repeat(self.channels, 1).t().cpu().numpy()
+        # 获取 outdata 的实际大小
+        actual_frames = outdata.shape[0]
+
+        # 确保我们只使用与 outdata 大小相匹配的 infer_wav 部分
+        processed_audio = infer_wav[:actual_frames].repeat(self.channels, 1).t().cpu().numpy()
+
+        # 如果处理后的音频比 outdata 小，用零填充
+        if processed_audio.shape[0] < actual_frames:
+            padding = np.zeros((actual_frames - processed_audio.shape[0], self.channels))
+            processed_audio = np.vstack((processed_audio, padding))
+
+        # 将处理后的音频复制到 outdata
+        outdata[:] = processed_audio
 
         total_time = time.perf_counter() - start_time
         print(f"处理时间: {total_time*1000:.2f} ms")
